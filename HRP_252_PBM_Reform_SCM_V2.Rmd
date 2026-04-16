@@ -1,0 +1,778 @@
+---
+title: "HRP_252_PBM_Reform_SCM"
+output: html_document
+date: "2026-04-13"
+---
+```{r}
+library(dplyr)
+library(readr)
+library(tidysynth)
+library(janitor)
+library(ggplot2)
+
+
+# ============================================
+# 1. SDUD DATA
+# ============================================
+process_file <- function(file) {
+  if (!file.exists(file)) return(NULL)
+  
+  read_csv(file, show_col_types = FALSE) %>%
+    filter(State != "XX") %>%
+    mutate(
+      qtime = Year + (Quarter - 1) / 4,
+      across(c(`Number of Prescriptions`, `Total Amount Reimbursed`, `Units Reimbursed`), as.numeric)
+    ) %>%
+    group_by(State, qtime, Year, Quarter, `Utilization Type`) %>%
+    summarise(
+      rx = sum(`Number of Prescriptions`, na.rm = TRUE),
+      reimbursed = sum(`Total Amount Reimbursed`, na.rm = TRUE),
+      units = sum(`Units Reimbursed`, na.rm = TRUE),
+      .groups = "drop"
+    )
+}
+
+# Generate file list
+sdud_files <- paste0("SDUD/StateDrugUtilizationData-", 2015:2025, ".csv")
+panel_raw <- bind_rows(lapply(sdud_files, process_file))
+
+# Merge SDUD data into panel 
+panel <- panel_raw %>%
+  group_by(State, qtime, Year, Quarter) %>%
+  summarise(
+    total_rx = sum(rx, na.rm = TRUE),
+    total_reimbursed = sum(reimbursed, na.rm = TRUE),
+    total_units = sum(units, na.rm = TRUE),
+    ffsu_rx = sum(rx[`Utilization Type` == "FFSU"], na.rm = TRUE),
+    mcou_rx = sum(rx[`Utilization Type` == "MCOU"], na.rm = TRUE),
+    ffsu_share = ffsu_rx / total_rx,
+    .groups = "drop"
+  )
+```
+
+```{r}
+# ============================================
+# 2. ENROLLMENT DATA
+# ============================================
+enrollment <- read_csv("pi-dataset-march-2026release.csv", show_col_types = FALSE)
+
+enrollment_q <- enrollment %>%
+  mutate(
+    Year = as.integer(`Reporting Period` %/% 100),
+    Month = as.integer(`Reporting Period` %% 100),
+    Quarter = ceiling(Month / 3),
+    qtime = Year + (Quarter - 1) / 4
+  ) %>%
+  group_by(State = `State Abbreviation`, qtime) %>%
+  summarise(
+    enrollment = mean(`Total Medicaid and CHIP Enrollment`, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Merge enrollment into panel 
+panel <- panel %>%
+  left_join(enrollment_q, by = c("State", "qtime")) %>%
+  mutate(
+    rx_per_enrollee = total_rx / enrollment,
+    reimbursed_per_enrollee = total_reimbursed / enrollment
+  )
+```
+
+```{r}
+# ============================================
+# 3. SYNTHETIC CONTROL — California Carve-Out
+# ============================================
+treatment_time <- 2022.0
+
+contaminated <- c("OH", "NY", "WV", "TN", "MO", "ND", "WI")
+
+panel_ca <- panel %>%
+  filter(!State %in% contaminated, State != "XX", State != "PR") %>%
+  mutate(ffsu_share = ifelse(is.finite(ffsu_share), ffsu_share, 0))
+
+n_periods <- n_distinct(panel_ca$qtime)
+panel_ca <- panel_ca %>%
+  group_by(State) %>%
+  filter(n() == n_periods) %>%
+  ungroup()
+
+sc_ca <- panel_ca %>%
+  synthetic_control(
+    outcome = ffsu_share,
+    unit = State,
+    time = qtime,
+    i_unit = "CA",
+    i_time = treatment_time,
+    generate_placebos = TRUE
+  ) %>%
+  generate_predictor(
+    time_window = c(2015, treatment_time - 0.25),
+    ffsu_share = mean(ffsu_share, na.rm = TRUE),
+    rx_per_enrollee = mean(rx_per_enrollee, na.rm = TRUE),
+    cost_per_rx = mean(total_reimbursed / total_rx, na.rm = TRUE)
+  ) %>%
+  generate_weights(optimization_window = c(2015, treatment_time - 0.25)) %>%
+  generate_control()
+
+sc_ca %>% plot_trends()
+sc_ca %>% plot_differences()
+sc_ca %>% plot_placebos()
+sc_ca %>% plot_mspe_ratio()
+sc_ca %>% grab_unit_weights() %>% arrange(desc(weight))
+
+# SC for Cost per Rx
+panel_ca_cost <- panel %>%
+  filter(!State %in% contaminated, State != "XX", State != "PR") %>%
+  mutate(
+    cost_per_rx = total_reimbursed / total_rx,
+    ffsu_share = ifelse(is.finite(ffsu_share), ffsu_share, 0)
+  ) %>%
+  filter(is.finite(cost_per_rx))
+
+n_periods_cost <- n_distinct(panel_ca_cost$qtime)
+panel_ca_cost <- panel_ca_cost %>%
+  group_by(State) %>%
+  filter(n() == n_periods_cost) %>%
+  ungroup()
+
+sc_ca_cost <- panel_ca_cost %>%
+  synthetic_control(
+    outcome = cost_per_rx,
+    unit = State,
+    time = qtime,
+    i_unit = "CA",
+    i_time = treatment_time,
+    generate_placebos = TRUE
+  ) %>%
+  generate_predictor(
+    time_window = c(2015, treatment_time - 0.25),
+    cost_per_rx = mean(cost_per_rx, na.rm = TRUE),
+    rx_per_enrollee = mean(total_rx / enrollment, na.rm = TRUE),
+    ffsu_share = mean(ffsu_share, na.rm = TRUE)
+  ) %>%
+  generate_weights(optimization_window = c(2015, treatment_time - 0.25)) %>%
+  generate_control()
+
+sc_ca_cost %>% plot_trends()
+sc_ca_cost %>% plot_differences()
+sc_ca_cost %>% plot_placebos()
+sc_ca_cost %>% plot_mspe_ratio()
+```
+
+```{r}
+# ============================================
+# 4. DIFFERENCE-IN-DIFFERENCES — Robustness
+# ============================================
+library(fixest)
+
+
+
+panel_did_ca <- panel %>%
+  filter(!State %in% contaminated, State != "XX", State != "PR") %>%
+  mutate(
+    treated = as.integer(State == "CA"),
+    post = as.integer(qtime >= 2022.0),
+    ffsu_share = ifelse(is.finite(ffsu_share), ffsu_share, 0),
+    cost_per_rx = total_reimbursed / total_rx,
+    periods_to_treat = as.integer(round((qtime - 2022.0) * 4))
+  ) %>%
+  filter(!is.na(cost_per_rx), is.finite(cost_per_rx))
+
+# DiD regressions
+did_ffsu <- feols(ffsu_share ~ treated:post | State + qtime, data = panel_did_ca, vcov = ~State)
+did_cost <- feols(cost_per_rx ~ treated:post | State + qtime, data = panel_did_ca, vcov = ~State)
+summary(did_ffsu)
+summary(did_cost)
+
+# Event studies
+es_ffsu <- feols(ffsu_share ~ i(periods_to_treat, treated, ref = -1) | State + qtime,
+                 data = panel_did_ca, vcov = ~State)
+es_cost <- feols(cost_per_rx ~ i(periods_to_treat, treated, ref = -1) | State + qtime,
+                 data = panel_did_ca, vcov = ~State)
+
+iplot(es_ffsu, xlab = "Quarters relative to CA carve-out",
+      main = "Event Study: FFSU Share (California)")
+iplot(es_cost, xlab = "Quarters relative to CA carve-out",
+      main = "Event Study: Cost per Rx (California)")
+
+```
+
+```{r}
+# ============================================
+# 5. DOWNSTREAM EFFECTS OF CA CARVE-OUT
+# ============================================
+
+# Utilization effect
+es_rx <- feols(rx_per_enrollee ~ i(periods_to_treat, treated, ref = -1) | State + qtime,
+               data = panel_did_ca %>% filter(!is.na(rx_per_enrollee)), vcov = ~State)
+iplot(es_rx, xlab = "Quarters relative to CA carve-out",
+      main = "Event Study: Rx per Enrollee (California)")
+
+# Total reimbursement per enrollee
+es_reimb <- feols(reimbursed_per_enrollee ~ i(periods_to_treat, treated, ref = -1) | State + qtime,
+                  data = panel_did_ca %>% filter(!is.na(reimbursed_per_enrollee)), vcov = ~State)
+iplot(es_reimb, xlab = "Quarters relative to CA carve-out",
+      main = "Event Study: Reimbursement per Enrollee (California)")
+
+# Units per prescription
+panel_did_ca <- panel_did_ca %>%
+  mutate(units_per_rx = total_units / total_rx)
+es_units <- feols(units_per_rx ~ i(periods_to_treat, treated, ref = -1) | State + qtime,
+                  data = panel_did_ca %>% filter(is.finite(units_per_rx)), vcov = ~State)
+iplot(es_units, xlab = "Quarters relative to CA carve-out",
+      main = "Event Study: Units per Rx (California)")
+
+# DiD point estimates
+did_rx <- feols(rx_per_enrollee ~ treated:post | State + qtime,
+                data = panel_did_ca %>% filter(!is.na(rx_per_enrollee)), vcov = ~State)
+did_reimb <- feols(reimbursed_per_enrollee ~ treated:post | State + qtime,
+                   data = panel_did_ca %>% filter(!is.na(reimbursed_per_enrollee)), vcov = ~State)
+did_units <- feols(units_per_rx ~ treated:post | State + qtime,
+                   data = panel_did_ca %>% filter(is.finite(units_per_rx)), vcov = ~State)
+
+
+summary(did_rx)
+summary(did_reimb)
+summary(did_units)
+```
+
+```{r}
+# ============================================
+# 6. FULL DiD FOR NY AND WV
+# ============================================
+
+# Define WV panel
+panel_wv <- panel %>%
+  filter(!State %in% c("MO", "TN", "WI", "ND", "OH", "CA", "NY", "XX", "PR")) %>%
+  mutate(
+    treated = as.integer(State == "WV"),
+    post = as.integer(qtime >= 2017.5),
+    cost_per_rx = total_reimbursed / total_rx,
+    reimbursed_per_enrollee = total_reimbursed / enrollment,
+    rx_per_enrollee = total_rx / enrollment,
+    units_per_rx = total_units / total_rx
+  ) %>%
+  filter(is.finite(cost_per_rx))
+
+# Define NY panel
+panel_ny <- panel %>%
+  filter(!State %in% c("MO", "TN", "WI", "ND", "OH", "CA", "WV", "XX", "PR")) %>%
+  mutate(
+    treated = as.integer(State == "NY"),
+    post = as.integer(qtime >= 2023.25),
+    cost_per_rx = total_reimbursed / total_rx,
+    reimbursed_per_enrollee = total_reimbursed / enrollment,
+    rx_per_enrollee = total_rx / enrollment,
+    units_per_rx = total_units / total_rx
+  ) %>%
+  filter(is.finite(cost_per_rx))
+
+# WV
+did_wv_cost <- feols(cost_per_rx ~ treated:post | State + qtime, data = panel_wv, vcov = ~State)
+did_wv_rx <- feols(rx_per_enrollee ~ treated:post | State + qtime,
+                   data = panel_wv %>% filter(!is.na(rx_per_enrollee)), vcov = ~State)
+did_wv_reimb <- feols(reimbursed_per_enrollee ~ treated:post | State + qtime,
+                      data = panel_wv %>% filter(!is.na(reimbursed_per_enrollee)), vcov = ~State)
+did_wv_units <- feols(units_per_rx ~ treated:post | State + qtime,
+                      data = panel_wv %>% filter(is.finite(units_per_rx)), vcov = ~State)
+summary(did_wv_cost)
+summary(did_wv_rx)
+summary(did_wv_reimb)
+summary(did_wv_units)
+
+# NY
+did_ny_cost <- feols(cost_per_rx ~ treated:post | State + qtime, data = panel_ny, vcov = ~State)
+did_ny_rx <- feols(rx_per_enrollee ~ treated:post | State + qtime,
+                   data = panel_ny %>% filter(!is.na(rx_per_enrollee)), vcov = ~State)
+did_ny_reimb <- feols(reimbursed_per_enrollee ~ treated:post | State + qtime,
+                      data = panel_ny %>% filter(!is.na(reimbursed_per_enrollee)), vcov = ~State)
+did_ny_units <- feols(units_per_rx ~ treated:post | State + qtime,
+                      data = panel_ny %>% filter(is.finite(units_per_rx)), vcov = ~State)
+summary(did_ny_cost)
+summary(did_ny_rx)
+summary(did_ny_reimb)
+summary(did_ny_units)
+```
+
+```{r}
+# ============================================
+# 7. STAGGERED DiD — WV + CA + NY CARVE-OUTS
+# ============================================
+
+panel_stag <- panel %>%
+  filter(State != "XX", State != "PR",
+         !State %in% c("MO", "TN", "WI", "ND", "OH")) %>%
+  mutate(
+    treat_time = case_when(
+      State == "WV" ~ 2017.5,
+      State == "CA" ~ 2022.0,
+      State == "NY" ~ 2023.25,
+      TRUE ~ Inf
+    ),
+    cost_per_rx = total_reimbursed / total_rx,
+    ffsu_share = ifelse(is.finite(ffsu_share), ffsu_share, 0)
+  ) %>%
+  filter(is.finite(cost_per_rx))
+
+# Staggered event studies
+es_stag_ffsu <- feols(ffsu_share ~ sunab(treat_time, qtime) | State + qtime,
+                      data = panel_stag, vcov = ~State)
+iplot(es_stag_ffsu, xlab = "Quarters relative to carve-out",
+      main = "Staggered Event Study: FFSU Share (WV + CA + NY)")
+
+es_stag_cost <- feols(cost_per_rx ~ sunab(treat_time, qtime) | State + qtime,
+                      data = panel_stag, vcov = ~State)
+iplot(es_stag_cost, xlab = "Quarters relative to carve-out",
+      main = "Staggered Event Study: Cost per Rx (WV + CA + NY)")
+
+es_stag_rx <- feols(rx_per_enrollee ~ sunab(treat_time, qtime) | State + qtime,
+                    data = panel_stag %>% filter(!is.na(rx_per_enrollee)), vcov = ~State)
+iplot(es_stag_rx, xlab = "Quarters relative to carve-out",
+      main = "Staggered Event Study: Rx per Enrollee (WV + CA + NY)")
+
+es_stag_reimb <- feols(reimbursed_per_enrollee ~ sunab(treat_time, qtime) | State + qtime,
+                       data = panel_stag %>% filter(!is.na(reimbursed_per_enrollee)), vcov = ~State)
+iplot(es_stag_reimb, xlab = "Quarters relative to carve-out",
+      main = "Staggered Event Study: Reimbursement per Enrollee (WV + CA + NY)")
+
+summary(es_stag_cost)
+summary(es_stag_rx)
+summary(es_stag_reimb)
+```
+
+```{r}
+# ============================================
+# 8. PART D PLACEBO TEST — CALIFORNIA
+# ============================================
+
+partd_files <- list.files("Medicare_Part_D_Prescribers_Geography_Drug",
+                          pattern = "\\.csv$", full.names = TRUE)
+
+process_partd <- function(file) {
+  year <- as.numeric(gsub(".*DY(\\d{2}).*", "\\1", basename(file))) + 2000
+  read_csv(file, show_col_types = FALSE) %>%
+    filter(Prscrbr_Geo_Lvl == "State") %>%
+    group_by(State = Prscrbr_Geo_Cd) %>%
+    summarise(
+      partd_claims = sum(Tot_Clms, na.rm = TRUE),
+      partd_cost = sum(Tot_Drug_Cst, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    mutate(Year = year)
+}
+
+partd_raw <- bind_rows(lapply(partd_files, process_partd))
+
+fips_to_state <- data.frame(
+  fips = sprintf("%02d", c(1:2,4:6,8:13,15:42,44:51,53:56)),
+  State = c("AL","AK","AZ","AR","CA","CO","CT","DE","DC","FL",
+            "GA","HI","ID","IL","IN","IA","KS","KY","LA","ME",
+            "MD","MA","MI","MN","MS","MO","MT","NE","NV","NH",
+            "NJ","NM","NY","NC","ND","OH","OK","OR","PA","RI",
+            "SC","SD","TN","TX","UT","VT","VA","WA","WV","WI","WY")
+)
+
+partd_raw <- partd_raw %>%
+  mutate(State = sprintf("%02d", as.numeric(State)))
+
+partd_raw <- partd_raw %>%
+  left_join(fips_to_state, by = c("State" = "fips")) %>%
+  select(-State) %>%
+  rename(State = State.y)
+
+partd_panel <- partd_raw %>%
+  filter(!is.na(State)) %>%
+  mutate(
+    cost_per_claim = partd_cost / partd_claims,
+    treated = as.integer(State == "CA"),
+    post = as.integer(Year >= 2022),
+    periods_to_treat = Year - 2022
+  ) %>%
+  filter(!State %in% c("MO", "TN", "WV", "WI", "ND", "OH", "NY", "XX", "PR"))
+
+did_partd <- feols(cost_per_claim ~ treated:post | State + Year, data = partd_panel)
+summary(did_partd)
+
+es_partd <- feols(cost_per_claim ~ i(periods_to_treat, treated, ref = -1) | State + Year,
+                  data = partd_panel)
+iplot(es_partd, xlab = "Years relative to CA carve-out",
+      main = "Placebo: Part D Cost per Claim (California)")
+
+```
+
+```{r}
+# ============================================
+# 9. SUMMARY RESULTS TABLE
+# ============================================
+
+results <- data.frame(
+  State = c("CA", "CA", "CA", "CA",
+            "NY", "NY", "NY", "NY",
+            "WV", "WV", "WV", "WV",
+            "CA (Part D)"),
+  Outcome = c("Cost per Rx", "Rx per Enrollee", "Reimbursement per Enrollee", "Units per Rx",
+              "Cost per Rx", "Rx per Enrollee", "Reimbursement per Enrollee", "Units per Rx",
+              "Cost per Rx", "Rx per Enrollee", "Reimbursement per Enrollee", "Units per Rx",
+              "Cost per Claim"),
+  Estimate = c(coef(did_cost), coef(did_rx), coef(did_reimb), coef(did_units),
+               coef(did_ny_cost), coef(did_ny_rx), coef(did_ny_reimb), coef(did_ny_units),
+               coef(did_wv_cost), coef(did_wv_rx), coef(did_wv_reimb), coef(did_wv_units),
+               coef(did_partd)),
+  SE = c(se(did_cost), se(did_rx), se(did_reimb), se(did_units),
+         se(did_ny_cost), se(did_ny_rx), se(did_ny_reimb), se(did_ny_units),
+         se(did_wv_cost), se(did_wv_rx), se(did_wv_reimb), se(did_wv_units),
+         se(did_partd)),
+  P_value = c(pvalue(did_cost), pvalue(did_rx), pvalue(did_reimb), pvalue(did_units),
+              pvalue(did_ny_cost), pvalue(did_ny_rx), pvalue(did_ny_reimb), pvalue(did_ny_units),
+              pvalue(did_wv_cost), pvalue(did_wv_rx), pvalue(did_wv_reimb), pvalue(did_wv_units),
+              pvalue(did_partd))
+)
+
+results <- results %>%
+  mutate(
+    Estimate = round(Estimate, 2),
+    SE = round(SE, 2),
+    P_value = round(P_value, 4),
+    Sig = case_when(
+      P_value < 0.001 ~ "***",
+      P_value < 0.01 ~ "**",
+      P_value < 0.05 ~ "*",
+      P_value < 0.1 ~ ".",
+      TRUE ~ ""
+    )
+  )
+
+print(results, row.names = FALSE)
+```
+
+```{r}
+# ============================================
+# 10. NADAC SPREAD ANALYSIS — PBM TRANSPARENCY
+# ============================================
+
+# Load all NADAC files, get quarterly average NADAC per NDC
+process_nadac <- function(file) {
+  read_csv(file, show_col_types = FALSE) %>%
+    clean_names() %>%
+    mutate(
+      eff_date = as.Date(effective_date, format = "%m/%d/%Y"),
+      Year = as.integer(format(eff_date, "%Y")),
+      Quarter = ceiling(as.integer(format(eff_date, "%m")) / 3),
+      qtime = Year + (Quarter - 1) / 4,
+      NDC = sprintf("%011.0f", as.numeric(ndc))
+    ) %>%
+    filter(!is.na(qtime)) %>%
+    group_by(NDC, qtime, classification_for_rate_setting) %>%
+    summarise(
+      nadac_per_unit = mean(nadac_per_unit, na.rm = TRUE),
+      .groups = "drop"
+    )
+}
+
+nadac_files <- paste0("NADAC/nadac-national-average-drug-acquisition-cost-",
+                      2015:2025, ".csv")
+nadac_all <- bind_rows(lapply(nadac_files, process_nadac))
+
+# Load SDUD at NDC level — process one year at a time to save memory
+process_ndc <- function(file) {
+  read_csv(file, show_col_types = FALSE) %>%
+    filter(State != "XX") %>%
+    mutate(
+      qtime = Year + (Quarter - 1) / 4,
+      NDC = sprintf("%011.0f", as.numeric(NDC)),
+      `Units Reimbursed` = as.numeric(`Units Reimbursed`),
+      `Total Amount Reimbursed` = as.numeric(`Total Amount Reimbursed`),
+      `Number of Prescriptions` = as.numeric(`Number of Prescriptions`)
+    ) %>%
+    filter(!is.na(`Units Reimbursed`), `Units Reimbursed` > 0) %>%
+    group_by(State, NDC, qtime) %>%
+    summarise(
+      units = sum(`Units Reimbursed`, na.rm = TRUE),
+      reimbursed = sum(`Total Amount Reimbursed`, na.rm = TRUE),
+      rx = sum(`Number of Prescriptions`, na.rm = TRUE),
+      .groups = "drop"
+    )
+}
+
+sdud_files <- paste0("SDUD/StateDrugUtilizationData-", 2015:2025, ".csv")
+ndc_panel <- bind_rows(lapply(sdud_files, process_ndc))
+
+# Join SDUD to NADAC by NDC and quarter
+ndc_spread <- ndc_panel %>%
+  inner_join(nadac_all, by = c("NDC", "qtime")) %>%
+  mutate(
+    reimbursed_per_unit = reimbursed / units,
+    spread = reimbursed_per_unit - nadac_per_unit,
+    spread_pct = spread / nadac_per_unit * 100
+  ) %>%
+  filter(is.finite(spread_pct), abs(spread_pct) < 1000)
+
+# --- CROSS-SECTIONAL: CA vs managed care states ---
+
+# Excluding WV from visualizations — WV's July 2017 carve-out transition
+# caused a temporary reimbursement crash below NADAC that distorts the
+# "Other Carved Out" group average. WV remains in all DiD/SC analyses.
+
+other_carveout <- c("NY", "MO", "TN", "WI", "ND")
+
+spread_by_type_clean <- ndc_spread %>%
+  filter(!State %in% c("WV", "XX", "PR")) %>%
+  mutate(
+    state_type = case_when(
+      State == "CA" ~ "CA (Carved Out)",
+      State %in% other_carveout ~ "Other Carved Out",
+      TRUE ~ "Managed Care (Carved In)"
+    )
+  ) %>%
+  group_by(state_type, qtime) %>%
+  summarise(
+    mean_spread = weighted.mean(spread, units, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Plot spread over time by state type
+ggplot(spread_by_type_clean, aes(x = qtime, y = mean_spread, color = state_type)) +
+  geom_line(linewidth = 1) +
+  geom_vline(xintercept = 2022.0, linetype = "dashed") +
+  labs(title = "Reimbursement Spread Above NADAC Over Time (excl. WV)",
+       x = "Time", y = "Mean Spread ($ per unit)",
+       color = "State Type") +
+  theme_minimal()
+
+# Brand vs generic spread over time (also excluding WV for consistency)
+brand_spread_time <- ndc_spread %>%
+  filter(!State %in% c("WV", "XX", "PR")) %>%
+  mutate(
+    drug_type = ifelse(classification_for_rate_setting == "G", "Generic", "Brand"),
+    state_type = case_when(
+      State == "CA" ~ "CA (Carved Out)",
+      State %in% other_carveout ~ "Other Carved Out",
+      TRUE ~ "Managed Care (Carved In)"
+    )
+  ) %>%
+  group_by(state_type, drug_type, qtime) %>%
+  summarise(
+    mean_spread = weighted.mean(spread, units, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+ggplot(brand_spread_time, aes(x = qtime, y = mean_spread, color = state_type)) +
+  geom_line(linewidth = 1) +
+  geom_vline(xintercept = 2022.0, linetype = "dashed") +
+  facet_wrap(~drug_type, scales = "free_y") +
+  labs(title = "Reimbursement Spread Above NADAC: Brand vs Generic (excl. WV)",
+       x = "Time", y = "Mean Spread ($ per unit)",
+       color = "State Type") +
+  theme_minimal()
+
+# --- DiD on spread: did CA's spread change post-carve-out? ---
+state_spread_panel <- ndc_spread %>%
+  group_by(State, qtime) %>%
+  summarise(
+    mean_spread = weighted.mean(spread, units, na.rm = TRUE),
+    mean_spread_pct = weighted.mean(spread_pct, units, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  filter(!State %in% c("MO", "TN", "WI", "ND", "OH", "NY", "WV", "XX", "PR")) %>%
+  mutate(
+    treated = as.integer(State == "CA"),
+    post = as.integer(qtime >= 2022.0),
+    periods_to_treat = round((qtime - 2022.0) * 4)
+  )
+
+did_spread <- feols(mean_spread ~ treated:post | State + qtime,
+                    data = state_spread_panel, vcov = ~State)
+summary(did_spread)
+
+es_spread <- feols(mean_spread ~ i(periods_to_treat, treated, ref = -1) | State + qtime,
+                   data = state_spread_panel, vcov = ~State)
+iplot(es_spread, xlab = "Quarters relative to CA carve-out",
+      main = "Event Study: Reimbursement Spread Above NADAC (California)")
+
+# State-level spread summary (post-carve-out only)
+state_spread_post <- ndc_spread %>%
+  filter(qtime >= 2022.0) %>%
+  group_by(State) %>%
+  summarise(
+    mean_spread = weighted.mean(spread, units, na.rm = TRUE),
+    mean_spread_pct = weighted.mean(spread_pct, units, na.rm = TRUE),
+    total_excess = sum(spread * units, na.rm = TRUE) / 1e6,  # in millions
+    .groups = "drop"
+  ) %>%
+  arrange(mean_spread)
+
+cat("\nPost-Carve-Out State Spread Summary (sorted by spread):\n")
+print(state_spread_post, n = 55)
+
+
+```
+
+```{r}
+# ============================================
+# 11. DRUG CLASS HETEROGENEITY 
+# ============================================
+
+process_file_drugs <- function(file) {
+  read_csv(file, show_col_types = FALSE) %>%
+    filter(State != "XX") %>%
+    mutate(
+      qtime = Year + (Quarter - 1) / 4,
+      `Number of Prescriptions` = as.numeric(`Number of Prescriptions`),
+      `Total Amount Reimbursed` = as.numeric(`Total Amount Reimbursed`),
+      drug_class = case_when(
+        grepl("METFORMIN|INSULIN|GLIPIZIDE|GLYBURIDE|JARDIANCE|FARXIGA|OZEMPIC|TRULICITY",
+              `Product Name`, ignore.case = TRUE) ~ "Antidiabetic",
+        grepl("LISINOPRIL|AMLODIPINE|LOSARTAN|METOPROLOL|ATENOLOL|HYDROCHLOROT",
+              `Product Name`, ignore.case = TRUE) ~ "Antihypertensive",
+        grepl("ATORVAST|SIMVAST|ROSUVAST|LIPITOR|CRESTOR|ZOCOR",
+              `Product Name`, ignore.case = TRUE) & 
+          !grepl("NYSTATIN|SPRAVATO", `Product Name`, ignore.case = TRUE) ~ "Statin",
+        grepl("SERTRALINE|FLUOXETINE|ESCITALOPRAM|CITALOPRAM|VENLAFAXINE|DULOXETINE|BUPROPION",
+              `Product Name`, ignore.case = TRUE) ~ "Antidepressant",
+        grepl("RISPER|QUETIAPINE|OLANZAPINE|ARIPIPR|CLOZAPINE|ZIPRAS",
+              `Product Name`, ignore.case = TRUE) ~ "Antipsychotic",
+        grepl("EMTRICITAB|TENOFOVIR|BIKTARVY|DESCOVY|TRUVADA|DOVATO|TRIUMEQ",
+              `Product Name`, ignore.case = TRUE) ~ "HIV Antiretroviral",
+        TRUE ~ "Other"
+      ) 
+    ) %>%
+    filter(drug_class != "Other") %>%
+    group_by(State, qtime, drug_class) %>%
+    summarise(
+      rx = sum(`Number of Prescriptions`, na.rm = TRUE),
+      reimbursed = sum(`Total Amount Reimbursed`, na.rm = TRUE),
+      .groups = "drop"
+    )
+}
+
+sdud_files <- paste0("SDUD/StateDrugUtilizationData-", 2015:2025, ".csv")
+drugs_raw <- bind_rows(lapply(sdud_files, process_file_drugs))
+
+# Merge enrollment
+drugs_panel <- drugs_raw %>%
+  left_join(enrollment_q, by = c("State", "qtime")) %>%
+  mutate(
+    rx_per_enrollee = rx / enrollment,
+    cost_per_rx = reimbursed / rx
+  ) %>%
+  filter(!State %in% c("MO", "TN", "WI", "ND", "OH", "NY", "WV", "XX", "PR"),
+         !is.na(rx_per_enrollee), is.finite(cost_per_rx)) %>%
+  mutate(
+    treated = as.integer(State == "CA"),
+    post = as.integer(qtime >= 2022.0),
+    periods_to_treat = round((qtime - 2022.0) * 4)
+  )
+
+# DiD by drug class
+drug_classes <- unique(drugs_panel$drug_class)
+util_results <- list()
+cost_results <- list()
+
+for (dc in drug_classes) {
+  d <- drugs_panel %>% filter(drug_class == dc)
+  
+  did_u <- feols(rx_per_enrollee ~ treated:post | State + qtime, data = d, vcov = ~State)
+  util_results[[dc]] <- data.frame(
+    Drug_Class = dc,
+    Outcome = "Rx per Enrollee",
+    Estimate = round(coef(did_u), 4),
+    SE = round(se(did_u), 4),
+    P_value = round(pvalue(did_u), 4)
+  )
+  cat("\n===", dc, "— Rx per Enrollee ===\n")
+  print(summary(did_u))
+  
+  did_c <- feols(cost_per_rx ~ treated:post | State + qtime, data = d, vcov = ~State)
+  cost_results[[dc]] <- data.frame(
+    Drug_Class = dc,
+    Outcome = "Cost per Rx",
+    Estimate = round(coef(did_c), 2),
+    SE = round(se(did_c), 2),
+    P_value = round(pvalue(did_c), 4)
+  )
+  cat("\n===", dc, "— Cost per Rx ===\n")
+  print(summary(did_c))
+}
+
+# Combined results table
+drug_results <- bind_rows(bind_rows(util_results), bind_rows(cost_results)) %>%
+  mutate(
+    Sig = case_when(
+      P_value < 0.001 ~ "***",
+      P_value < 0.01 ~ "**",
+      P_value < 0.05 ~ "*",
+      P_value < 0.1 ~ ".",
+      TRUE ~ ""
+    )
+  )
+print(drug_results, row.names = FALSE)
+```
+```{r}
+# ============================================
+# EVENT STUDIES — BEHAVIORAL HEALTH & HIV
+# ============================================
+
+# Antipsychotics
+d_psych <- drugs_panel %>% filter(drug_class == "Antipsychotic")
+es_psych_rx <- feols(rx_per_enrollee ~ i(periods_to_treat, treated, ref = -1) | State + qtime,
+                     data = d_psych, vcov = ~State)
+iplot(es_psych_rx, xlab = "Quarters relative to CA carve-out",
+      main = "Event Study: Antipsychotic Rx per Enrollee (California)")
+
+es_psych_cost <- feols(cost_per_rx ~ i(periods_to_treat, treated, ref = -1) | State + qtime,
+                       data = d_psych, vcov = ~State)
+iplot(es_psych_cost, xlab = "Quarters relative to CA carve-out",
+      main = "Event Study: Antipsychotic Cost per Rx (California)")
+
+# Antidepressants
+d_depr <- drugs_panel %>% filter(drug_class == "Antidepressant")
+es_depr_rx <- feols(rx_per_enrollee ~ i(periods_to_treat, treated, ref = -1) | State + qtime,
+                    data = d_depr, vcov = ~State)
+iplot(es_depr_rx, xlab = "Quarters relative to CA carve-out",
+      main = "Event Study: Antidepressant Rx per Enrollee (California)")
+
+es_depr_cost <- feols(cost_per_rx ~ i(periods_to_treat, treated, ref = -1) | State + qtime,
+                      data = d_depr, vcov = ~State)
+iplot(es_depr_cost, xlab = "Quarters relative to CA carve-out",
+      main = "Event Study: Antidepressant Cost per Rx (California)")
+
+# HIV Antiretrovirals
+d_hiv <- drugs_panel %>% filter(drug_class == "HIV Antiretroviral")
+es_hiv_rx <- feols(rx_per_enrollee ~ i(periods_to_treat, treated, ref = -1) | State + qtime,
+                   data = d_hiv, vcov = ~State)
+iplot(es_hiv_rx, xlab = "Quarters relative to CA carve-out",
+      main = "Event Study: HIV Antiretroviral Rx per Enrollee (California)")
+
+es_hiv_cost <- feols(cost_per_rx ~ i(periods_to_treat, treated, ref = -1) | State + qtime,
+                     data = d_hiv, vcov = ~State)
+iplot(es_hiv_cost, xlab = "Quarters relative to CA carve-out",
+      main = "Event Study: HIV Antiretroviral Cost per Rx (California)")
+
+# Antidiabetics
+d_diab <- drugs_panel %>% filter(drug_class == "Antidiabetic")
+es_diab_rx <- feols(rx_per_enrollee ~ i(periods_to_treat, treated, ref = -1) | State + qtime,
+                    data = d_diab, vcov = ~State)
+iplot(es_diab_rx, xlab = "Quarters relative to CA carve-out",
+      main = "Event Study: Antidiabetic Rx per Enrollee (California)")
+
+es_diab_cost <- feols(cost_per_rx ~ i(periods_to_treat, treated, ref = -1) | State + qtime,
+                      data = d_diab, vcov = ~State)
+iplot(es_diab_cost, xlab = "Quarters relative to CA carve-out",
+      main = "Event Study: Antidiabetic Cost per Rx (California)")
+
+# Antihypertensives
+d_htn <- drugs_panel %>% filter(drug_class == "Antihypertensive")
+es_htn_rx <- feols(rx_per_enrollee ~ i(periods_to_treat, treated, ref = -1) | State + qtime,
+                   data = d_htn, vcov = ~State)
+iplot(es_htn_rx, xlab = "Quarters relative to CA carve-out",
+      main = "Event Study: Antihypertensive Rx per Enrollee (California)")
+
+# Statins
+d_stat <- drugs_panel %>% filter(drug_class == "Statin")
+es_stat_rx <- feols(rx_per_enrollee ~ i(periods_to_treat, treated, ref = -1) | State + qtime,
+                    data = d_stat, vcov = ~State)
+iplot(es_stat_rx, xlab = "Quarters relative to CA carve-out",
+      main = "Event Study: Statin Rx per Enrollee (California)")
+
+```
+
